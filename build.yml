@@ -1,0 +1,119 @@
+name: Build Kernel & AnyKernel3
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: '设备代号，例如 alioth、dagu、cmi'
+        required: true
+        default: 'alioth'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout 内核源码
+        uses: actions/checkout@v4
+        with:
+          ref: lineage-23.2
+          fetch-depth: 1
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex \
+            g++-multilib gcc-multilib git gnupg gperf \
+            imagemagick lib32ncurses5-dev lib32readline-dev \
+            lib32z1-dev libelf-dev liblz4-tool libncurses-dev \
+            libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop \
+            pngcrush rsync schedtool squashfs-tools xsltproc zip \
+            zlib1g-dev python3 python3-pip \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: 下载 Proton Clang
+        run: |
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang.git ~/proton-clang
+          echo "$HOME/proton-clang/bin" >> $GITHUB_PATH
+
+      - name: 创建 Swap（防止内存不足）
+        run: |
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
+      - name: 列出可用的 defconfig
+        run: |
+          find arch/arm64/configs -name "*_defconfig" | sort
+
+      - name: 编译内核
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          export CC=clang
+          export LD=ld.lld
+          export AR=llvm-ar
+          export NM=llvm-nm
+          export OBJCOPY=llvm-objcopy
+          export OBJDUMP=llvm-objdump
+          export STRIP=llvm-strip
+
+          DEVICE="${{ github.event.inputs.device }}"
+          DEFCONFIG="vendor/xiaomi/${DEVICE}_defconfig"
+
+          if [ ! -f "arch/arm64/configs/${DEFCONFIG}" ]; then
+            DEFCONFIG=$(find arch/arm64/configs -name "${DEVICE}_defconfig" | head -n 1 | sed 's|arch/arm64/configs/||')
+          fi
+
+          echo "使用的 defconfig: $DEFCONFIG"
+          if [ -z "$DEFCONFIG" ] || [ ! -f "arch/arm64/configs/${DEFCONFIG}" ]; then
+            echo "找不到设备 ${DEVICE} 的 defconfig，请检查设备代号。"
+            exit 1
+          fi
+
+          make O=out ARCH=arm64 "$DEFCONFIG"
+          make -j$(nproc) O=out ARCH=arm64
+
+      - name: 准备 AnyKernel3 模板
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git -b master AnyKernel3
+
+      - name: 复制内核文件到 AnyKernel3
+        run: |
+          # 复制内核镜像
+          cp out/arch/arm64/boot/Image.gz AnyKernel3/Image.gz 2>/dev/null || \
+          cp out/arch/arm64/boot/Image AnyKernel3/Image
+
+          # 如果存在 dtbo.img，一并复制
+          if [ -f out/arch/arm64/boot/dtbo.img ]; then
+            cp out/arch/arm64/boot/dtbo.img AnyKernel3/dtbo.img
+          fi
+
+          # 可选：复制单独生成的 dtb
+          # cp out/arch/arm64/boot/dts/vendor/qcom/*.dtb AnyKernel3/dtb 2>/dev/null || true
+
+      - name: 配置 AnyKernel3
+        run: |
+          DEVICE="${{ github.event.inputs.device }}"
+          # 设置设备代号，关闭设备检查，开启 A/B 分区支持
+          sed -i "s/^device.name1=.*/device.name1=${DEVICE}/" AnyKernel3/anykernel.sh
+          sed -i "s/^do.devicecheck=.*/do.devicecheck=0/" AnyKernel3/anykernel.sh
+          sed -i "s/^IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=1/" AnyKernel3/anykernel.sh
+          # 如果 anykernel.sh 中变量带引号，也做兼容处理
+          sed -i "s/^device.name1=\".*\"/device.name1=\"${DEVICE}\"/" AnyKernel3/anykernel.sh
+
+      - name: 打包 AnyKernel3 ZIP
+        run: |
+          cd AnyKernel3
+          zip -r9 "../kernel-${DEVICE}-AnyKernel3.zip" ./* -x ".git" ".gitignore" "*.zip"
+
+      - name: 上传卡刷包
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ github.event.inputs.device }}-AnyKernel3
+          path: kernel-${{ github.event.inputs.device }}-AnyKernel3.zip
+          if-no-files-found: error
